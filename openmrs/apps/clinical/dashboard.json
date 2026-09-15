@@ -436,6 +436,15 @@
                 "formGroup": [],
                 "translationKey": "DASHBOARD_TITLE_FORMS_DISPLAY_CONTROL_KEY"
             },
+            "forms-v2-react": {
+                "type": "formsV2React",
+                "displayOrder": 19,
+                "dashboardConfig": {
+                    "title": null,
+                    "maximumNoOfVisits": 10
+                },
+                "translationKey": "Observation Forms"
+            },
             "patientAppointments": {
                 "type": "custom",
                 "hideEmptyDisplayControl": true,
