@@ -55,6 +55,7 @@ public class BahmniObsValueCalculator implements ObsValueCalculator {
     public void run(BahmniEncounterTransaction bahmniEncounterTransaction) {
         calculateAndAdd(bahmniEncounterTransaction);
         createFollowUpAppointment(bahmniEncounterTransaction);
+        createArvDrugOrders(bahmniEncounterTransaction);
     }
 
     static def calculateAndAdd(BahmniEncounterTransaction bahmniEncounterTransaction) {
@@ -730,6 +731,319 @@ public class BahmniObsValueCalculator implements ObsValueCalculator {
 
     private static void log(String message) {
         System.out.println("eReg — follow-up appointment: " + message)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // eReg — Auto-create ARV drug orders (Medications tab) from the Regimen section of
+    //        the HIV Treatment and Care follow-up form.
+    //
+    //   Trigger : "HIVTC, ART Regimen" AND "ARV drugs No. of days dispensed" both have a
+    //             value in the save ("ART, Follow-up date" is what fills days dispensed,
+    //             see formConditions.js).
+    //   Creates : one outpatient drug order per drug of the regimen (ARV_REGIMENS),
+    //             duration = days dispensed, quantity = tablets/dose x doses/day x days,
+    //             starting on the encounter date.
+    //   Skips   : - regimens with no entry in ARV_REGIMENS (paediatric 4x/5x/6x, d4T 1a/1b,
+    //               "Others", retired codes) - logged, the encounter still saves
+    //             - patients younger than ARV_MIN_AGE_YEARS (the doses below are adult doses)
+    //             - an encounter that already holds orders for the regimen's drugs
+    //               (editing / re-saving the form never duplicates orders)
+    //             - a drug the clinician ordered in the Medications tab in the same save
+    //             - a drug with an open-ended active order (no stop date)
+    //   Refill  : if a drug's previous order is still active, the new order is scheduled to
+    //             start one second after it ends (OpenMRS rejects overlapping orders).
+    //
+    //   This runs before Bahmni's own save steps (BahmniEncounterTransactionUpdateAdvice), so
+    //   the orders added here are validated and saved exactly like Medications-tab orders.
+    //
+    //   CLINICAL SIGN-OFF REQUIRED: the tablets/doses in ARV_REGIMENS are standard adult
+    //   doses; confirm them against the national ART guidelines before go-live.
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    static final String ART_REGIMEN_CONCEPT    = "HIVTC, ART Regimen"
+    static final String DAYS_DISPENSED_CONCEPT = "ARV drugs No. of days dispensed"
+    static final int    ARV_MIN_AGE_YEARS      = 15
+    static final int    ARV_MAX_DAYS           = 365
+    static final String FLEXIBLE_DOSING        = "org.openmrs.module.bahmniemrapi.drugorder.dosinginstructions.FlexibleDosingInstructions"
+
+    // Candidate names; the first one that exists in this database is used.
+    // (medication.json uses "Tablet" / "Days" on this site.)
+    static final List<String> ARV_DOSE_UNIT_NAMES     = ["Tablet", "Tablet(s)", "Tablets"]
+    static final List<String> ARV_DURATION_UNIT_NAMES = ["Days", "Day(s)"]
+    static final List<String> ARV_ROUTE_NAMES         = ["Oral"]
+    static final Map<Integer, List<String>> ARV_FREQUENCY_NAMES = [
+            1: ["Once a day", "Once daily", "OD"],
+            2: ["Twice a day", "Twice daily", "BD"]
+    ]
+
+    // OpenMRS drug names, exactly as they are in the drug table.
+    static final String TLD         = "1j=TDF-3TC-DTG 300/300/50mg"
+    static final String TDF_3TC_EFV = "1f=TDF-3TC-EFV 300/300/600mg"
+    static final String AZT_3TC_NVP = "1c=AZT-3TC-NVP 300/150/200mg"
+    static final String TDF_3TC     = "TDF-3TC 300/300mg"
+    static final String AZT_3TC     = "AZT-3TC 300/150mg"
+    static final String ABC_3TC     = "ABC-3TC 600/300mg"
+    static final String TDF         = "Tenofovir 300mg"
+    static final String DTG         = "Dolutegravir 50mg"
+    static final String EFV         = "Efavirenz 600mg"
+    static final String NVP         = "Nevirapine 200mg"
+    static final String LPV_R       = "Lopinavir and Ritonavir - 200/50mg"
+    static final String DRV         = "Darunavir 600mg"
+    static final String RTV         = "Ritonavir 100mg"
+    static final String RAL         = "Raltegravir 400mg"
+    static final String ETV         = "Etravirine 100mg"
+
+    // Regimen code (the text before "=" in the answer's name, e.g. "1j" in "1j=TDF-3TC-DTG")
+    //   -> list of [drug name, tablets per dose, doses per day]
+    static final Map<String, List<List>> ARV_REGIMENS = [
+            // ── Adult 1st line ──
+            "1c": [[AZT_3TC_NVP, 1, 2]],
+            "1d": [[AZT_3TC, 1, 2], [EFV, 1, 1]],
+            "1e": [[TDF_3TC, 1, 1], [NVP, 1, 2]],
+            "1f": [[TDF_3TC_EFV, 1, 1]],
+            "1g": [[ABC_3TC, 1, 1], [NVP, 1, 2]],
+            "1h": [[ABC_3TC, 1, 1], [EFV, 1, 1]],
+            "1j": [[TLD, 1, 1]],
+            "1k": [[ABC_3TC, 1, 1], [DTG, 1, 1]],
+            "1m": [[AZT_3TC, 1, 2], [DTG, 1, 1]],
+            "1n": [[TDF_3TC, 1, 1], [LPV_R, 2, 2]],
+            "1p": [[ABC_3TC, 1, 1], [LPV_R, 2, 2]],
+            "1q": [[AZT_3TC, 1, 2], [LPV_R, 2, 2]],
+            // ── Adult 2nd line ──
+            "2c": [[AZT_3TC, 1, 2], [LPV_R, 2, 2]],
+            "2d": [[TDF_3TC, 1, 1], [LPV_R, 2, 2]],
+            "2g": [[ABC_3TC, 1, 1], [LPV_R, 2, 2]],
+            "2i": [[AZT_3TC, 1, 2], [TDF, 1, 1], [LPV_R, 2, 2]],
+            "2j": [[TDF_3TC, 1, 1], [DRV, 1, 2], [RTV, 1, 2]],
+            "2k": [[ABC_3TC, 1, 1], [DRV, 1, 2], [RTV, 1, 2]],
+            "2l": [[AZT_3TC, 1, 2], [DRV, 1, 2], [RTV, 1, 2]],
+            "2m": [[TDF_3TC, 1, 1], [RAL, 1, 2]],
+            "2n": [[ABC_3TC, 1, 1], [RAL, 1, 2]],
+            "2o": [[AZT_3TC, 1, 2], [RAL, 1, 2]],
+            "2p": [[TLD, 1, 1]],
+            "2s": [[AZT_3TC, 1, 2], [TDF, 1, 1], [DTG, 1, 1]],
+            // ── Adult 3rd line ──
+            "3e": [[RAL, 1, 2], [ETV, 2, 2], [DRV, 1, 2], [RTV, 1, 2]],
+            "3f": [[DRV, 1, 2], [RTV, 1, 2], [DTG, 1, 1]],
+            "3g": [[DRV, 1, 2], [RTV, 1, 2], [RAL, 1, 2]],
+            "3h": [[LPV_R, 2, 2], [RAL, 1, 2]]
+            // Paediatric regimens (4x, 5x, 6x) are weight-banded: add them once the
+            // weight-band doses are agreed. d4T regimens (1a, 1b): no stavudine drug exists.
+    ]
+
+    static void createArvDrugOrders(BahmniEncounterTransaction etx) {
+        try {
+            Collection<BahmniObservation> observations = etx.getObservations()
+            if (observations == null || observations.isEmpty()) return
+
+            BahmniObservation regimenObs = find(ART_REGIMEN_CONCEPT, observations, null)
+            BahmniObservation daysObs    = find(DAYS_DISPENSED_CONCEPT, observations, null)
+            if (!hasValue(regimenObs) || regimenObs.voided) return
+            if (!hasValue(daysObs) || daysObs.voided) return
+
+            String regimenName = codedName(regimenObs)
+            String code = regimenCode(regimenName)
+            List<List> regimen = code == null ? null : ARV_REGIMENS.get(code)
+            if (regimen == null) {
+                arvLog("no drug mapping for regimen '" + regimenName + "' - no orders created")
+                return
+            }
+
+            int days = Math.round(daysObs.getValue() as Double) as int
+            if (days <= 0 || days > ARV_MAX_DAYS) {
+                arvLog("days dispensed " + days + " is out of range - no orders created")
+                return
+            }
+
+            Patient patient = Context.getPatientService().getPatientByUuid(etx.getPatientUuid())
+            if (patient == null) {
+                arvLog("patient not found by uuid " + etx.getPatientUuid() + " - no orders created")
+                return
+            }
+
+            // Null for a normal entry (Bahmni fills it in after this script); set for a
+            // retrospective entry.
+            Date encounterDate = etx.getEncounterDateTime()
+            Date startDate = encounterDate ?: new Date()
+
+            Integer age = patient.getAge(startDate)
+            if (age == null || age < ARV_MIN_AGE_YEARS) {
+                arvLog("patient age " + age + " is below " + ARV_MIN_AGE_YEARS + " - adult doses not applied, no orders created")
+                return
+            }
+
+            def orderService = Context.getOrderService()
+            String doseUnits     = firstExistingConcept(ARV_DOSE_UNIT_NAMES, orderService.getDrugDosingUnits())
+            String quantityUnits = firstExistingConcept(ARV_DOSE_UNIT_NAMES, orderService.getDrugDispensingUnits())
+            String durationUnits = firstExistingConcept(ARV_DURATION_UNIT_NAMES, orderService.getDurationUnits())
+            String route         = firstExistingConcept(ARV_ROUTE_NAMES, orderService.getDrugRoutes())
+            if (doseUnits == null || quantityUnits == null || durationUnits == null || route == null) {
+                arvLog("dose unit / dispensing unit / duration unit / route not found (" + doseUnits + ", " +
+                        quantityUnits + ", " + durationUnits + ", " + route + ") - no orders created")
+                return
+            }
+            // OpenMRS rejects a drug order whose duration unit has no SAME-AS map to a SNOMED CT
+            // (HL7 code "SCT") term, and that rejection fails the whole encounter save. Check first.
+            Concept durationConcept = orderService.getDurationUnits().find { c -> durationUnits.equalsIgnoreCase(c?.getName()?.getName()) }
+            if (!hasSnomedCtSameAsMap(durationConcept)) {
+                arvLog("duration unit '" + durationUnits + "' has no SAME-AS map to a SNOMED CT (SCT) source - " +
+                        "OpenMRS would reject the orders, so none were created")
+                return
+            }
+
+            // Resolve every drug and frequency first: a half-created regimen is worse than none.
+            List<Map> lines = []
+            for (List item : regimen) {
+                String drugName = item[0] as String
+                int dosesPerDay = item[2] as int
+                org.openmrs.Drug drug = Context.getConceptService().getDrug(drugName)
+                if (drug == null || drug.getRetired()) {
+                    arvLog("drug '" + drugName + "' not found or retired - no orders created for regimen " + code)
+                    return
+                }
+                String frequency = firstExistingFrequency(ARV_FREQUENCY_NAMES.get(dosesPerDay), orderService.getOrderFrequencies(false))
+                if (frequency == null) {
+                    arvLog("no order frequency for " + dosesPerDay + " dose(s) a day - no orders created")
+                    return
+                }
+                lines.add([drug: drug, tabletsPerDose: item[1] as double, dosesPerDay: dosesPerDay, frequency: frequency])
+            }
+
+            if (encounterHasOrdersFor(etx.getEncounterUuid(), lines.collect { it.drug as org.openmrs.Drug })) {
+                arvLog("encounter " + etx.getEncounterUuid() + " already has orders for regimen " + code + " - skipping")
+                return
+            }
+
+            List<org.openmrs.Order> activeOrders = orderService.getActiveOrders(patient, null, null, null) ?: []
+
+            List<EncounterTransaction.DrugOrder> newOrders = []
+            for (Map line : lines) {
+                org.openmrs.Drug drug = line.drug as org.openmrs.Drug
+
+                if (isOrderedInThisSave(etx, drug)) {
+                    arvLog("'" + drug.getName() + "' already ordered in the Medications tab - not added again")
+                    continue
+                }
+
+                // Refill: start after the previous order of the same drug ends.
+                Date orderStart = startDate
+                boolean openEnded = false
+                for (org.openmrs.Order active : activeOrders) {
+                    if (!(active instanceof org.openmrs.DrugOrder)) continue
+                    org.openmrs.Drug activeDrug = ((org.openmrs.DrugOrder) active).getDrug()
+                    if (activeDrug == null || activeDrug.getId() != drug.getId()) continue
+                    Date stop = active.getDateStopped() ?: active.getAutoExpireDate()
+                    if (stop == null) { openEnded = true; break }
+                    if (!stop.before(orderStart)) orderStart = new Date(stop.getTime() + 1000)
+                }
+                if (openEnded) {
+                    arvLog("'" + drug.getName() + "' has an active order with no stop date - not added")
+                    continue
+                }
+
+                double tabletsPerDose = line.tabletsPerDose as double
+                int dosesPerDay = line.dosesPerDay as int
+
+                EncounterTransaction.Drug drugRef = new EncounterTransaction.Drug()
+                drugRef.setUuid(drug.getUuid())
+                drugRef.setName(drug.getName())
+
+                EncounterTransaction.DosingInstructions dosing = new EncounterTransaction.DosingInstructions()
+                dosing.setDose(tabletsPerDose)
+                dosing.setDoseUnits(doseUnits)
+                dosing.setRoute(route)
+                dosing.setFrequency(line.frequency as String)
+                dosing.setAsNeeded(false)
+                dosing.setQuantity(tabletsPerDose * dosesPerDay * days)
+                dosing.setQuantityUnits(quantityUnits)
+                dosing.setNumberOfRefills(0)
+                dosing.setAdministrationInstructions('{"instructions":"As directed","additionalInstructions":"Auto-created from ART regimen ' + code + '"}')
+
+                EncounterTransaction.DrugOrder order = new EncounterTransaction.DrugOrder()
+                order.setCareSetting(org.openmrs.module.emrapi.CareSettingType.OUTPATIENT)
+                order.setAction("NEW")
+                order.setDrug(drugRef)
+                order.setDosingInstructionType(FLEXIBLE_DOSING)
+                order.setDosingInstructions(dosing)
+                order.setDuration(days)
+                order.setDurationUnits(durationUnits)
+                // Leave it unset for a normal entry starting now (Bahmni sets it to now). Never
+                // set it before the encounter date, or Bahmni moves the order to a past encounter.
+                if (encounterDate != null || orderStart.after(startDate)) {
+                    order.setScheduledDate(orderStart)
+                }
+                newOrders.add(order)
+            }
+
+            if (newOrders.isEmpty()) return
+
+            List<EncounterTransaction.DrugOrder> allOrders = new ArrayList<EncounterTransaction.DrugOrder>()
+            if (etx.getDrugOrders() != null) allOrders.addAll(etx.getDrugOrders())
+            allOrders.addAll(newOrders)
+            etx.setDrugOrders(allOrders)
+            arvLog("added " + newOrders.size() + " order(s) for regimen " + code + ", " + days + " days, patient " + patient.getUuid())
+        } catch (Exception e) {
+            // Never let order creation block a clinical save.
+            arvLog("failed to create ARV drug orders: " + e)
+            e.printStackTrace()
+        }
+    }
+
+    // "1j=TDF-3TC-DTG" -> "1j"; anything without "=" (e.g. "Others") -> null
+    private static String regimenCode(String regimenName) {
+        if (regimenName == null || !regimenName.contains("=")) return null
+        return regimenName.substring(0, regimenName.indexOf("=")).trim().toLowerCase()
+    }
+
+    private static String firstExistingConcept(List<String> candidates, List<Concept> concepts) {
+        if (concepts == null) return null
+        for (String candidate : candidates) {
+            Concept match = concepts.find { c -> c?.getName() != null && candidate.equalsIgnoreCase(c.getName().getName()) }
+            if (match != null) return match.getName().getName()
+        }
+        return null
+    }
+
+    // Mirrors org.openmrs.Duration.getCode(): SAME-AS map type + concept source with HL7 code "SCT".
+    private static boolean hasSnomedCtSameAsMap(Concept concept) {
+        if (concept == null || concept.getConceptMappings() == null) return false
+        return concept.getConceptMappings().any { m ->
+            m?.getConceptMapType()?.getUuid() == "35543629-7d8c-11e1-909d-c80aa9edcf4e" &&
+                    "SCT".equals(m?.getConceptReferenceTerm()?.getConceptSource()?.getHl7Code())
+        }
+    }
+
+    private static String firstExistingFrequency(List<String> candidates, List<org.openmrs.OrderFrequency> frequencies) {
+        if (candidates == null || frequencies == null) return null
+        for (String candidate : candidates) {
+            def match = frequencies.find { f -> candidate.equalsIgnoreCase(f?.getName()) }
+            if (match != null) return match.getName()
+        }
+        return null
+    }
+
+    // True when the saved encounter already has a live order for one of these drugs.
+    private static boolean encounterHasOrdersFor(String encounterUuid, List<org.openmrs.Drug> drugs) {
+        if (encounterUuid == null) return false
+        Encounter encounter = Context.getEncounterService().getEncounterByUuid(encounterUuid)
+        if (encounter == null || encounter.getOrders() == null) return false
+        Set<Integer> drugIds = drugs.collect { it.getId() } as Set
+        return encounter.getOrders().any { o ->
+            o instanceof org.openmrs.DrugOrder && !o.getVoided() &&
+                    ((org.openmrs.DrugOrder) o).getDrug() != null &&
+                    drugIds.contains(((org.openmrs.DrugOrder) o).getDrug().getId())
+        }
+    }
+
+    private static boolean isOrderedInThisSave(BahmniEncounterTransaction etx, org.openmrs.Drug drug) {
+        if (etx.getDrugOrders() == null) return false
+        return etx.getDrugOrders().any { o ->
+            o.getDrug() != null && (drug.getUuid().equals(o.getDrug().getUuid()) || drug.getName().equalsIgnoreCase(o.getDrug().getName()))
+        }
+    }
+
+    private static void arvLog(String message) {
+        System.out.println("eReg — ARV drug orders: " + message)
     }
 
 }

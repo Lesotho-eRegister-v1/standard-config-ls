@@ -423,4 +423,39 @@
             UPDATE person_attribute_type SET sort_weight = 4.5 WHERE name = 'Do you consent to be sent SMS reminders';
         </sql>
     </changeSet>
+    <changeSet id="LS-duration-units-snomed-ct-20261124" author="Lesotho-eRegister">
+        <comment>
+            OpenMRS only accepts a drug order duration unit (Day(s), Week(s), ...) that has a SAME-AS map
+            to a term in the concept source whose HL7 code is SCT. The duration units were only mapped to the
+            retired "SNOMED" source, so every drug order with a duration failed validation. Add the same codes
+            from the SNOMED CT (SCT) source. Idempotent: skips any unit that already has an SCT SAME-AS map.
+        </comment>
+        <sql>
+            INSERT INTO concept_reference_map (concept_reference_term_id, concept_map_type_id, creator, date_created, concept_id, uuid)
+            SELECT sct_term.concept_reference_term_id, m.concept_map_type_id, 1, now(), m.concept_id, uuid()
+            FROM concept_reference_map m
+                JOIN concept_map_type mt ON mt.concept_map_type_id = m.concept_map_type_id
+                    AND mt.uuid = '35543629-7d8c-11e1-909d-c80aa9edcf4e'
+                JOIN concept_reference_term old_term ON old_term.concept_reference_term_id = m.concept_reference_term_id
+                JOIN concept_reference_source old_source ON old_source.concept_source_id = old_term.concept_source_id
+                    AND (old_source.hl7_code IS NULL OR old_source.hl7_code &lt;&gt; 'SCT')
+                    AND old_source.name LIKE 'SNOMED%'
+                JOIN concept_reference_term sct_term ON sct_term.code = old_term.code AND sct_term.retired = 0
+                JOIN concept_reference_source sct_source ON sct_source.concept_source_id = sct_term.concept_source_id
+                    AND sct_source.hl7_code = 'SCT' AND sct_source.retired = 0
+            WHERE m.concept_id IN (
+                    SELECT cs.concept_id
+                    FROM concept_set cs
+                        JOIN concept unit_set ON unit_set.concept_id = cs.concept_set
+                        JOIN global_property gp ON gp.property_value = unit_set.uuid
+                            AND gp.property = 'order.durationUnitsConceptUuid')
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM concept_reference_map existing
+                        JOIN concept_reference_term et ON et.concept_reference_term_id = existing.concept_reference_term_id
+                        JOIN concept_reference_source es ON es.concept_source_id = et.concept_source_id AND es.hl7_code = 'SCT'
+                    WHERE existing.concept_id = m.concept_id
+                      AND existing.concept_map_type_id = m.concept_map_type_id);
+        </sql>
+    </changeSet>
 </databaseChangeLog>
